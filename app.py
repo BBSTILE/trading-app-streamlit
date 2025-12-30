@@ -9,10 +9,11 @@ st.sidebar.write(f"**Streamlit:** {st.__version__}")
 try:
     import pandas as pd
     import numpy as np
+    import plotly
     import plotly.graph_objects as go
     st.sidebar.write(f"**Pandas:** {pd.__version__}")
     st.sidebar.write(f"**Numpy:** {np.__version__}")
-    st.sidebar.write(f"**Plotly:** {go.__version__}")
+    st.sidebar.write(f"**Plotly:** {plotly.__version__}")  # ← CORRECTO
     st.sidebar.success("✅ Todas las dependencias cargadas")
 except Exception as e:
     st.sidebar.error(f"❌ Error: {e}")
@@ -2181,4 +2182,5 @@ with tabs[2]:
 st.sidebar.markdown("---")
 st.sidebar.markdown(f"**Versión:** {__version__}")
 st.sidebar.markdown("**Autor:** De Crypto Club")
+
 st.sidebar.markdown("**GitHub:** [de-crypto-club](https://github.com/de-crypto-club)")
