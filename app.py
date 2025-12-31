@@ -1,25 +1,4 @@
 import streamlit as st
-import sys
-
-# === VERIFICACIÓN DE VERSIONES (SOLO PARA DEBUG) ===
-st.sidebar.title("🔧 Sistema")
-st.sidebar.write(f"**Python:** {sys.version.split()[0]}")
-st.sidebar.write(f"**Streamlit:** {st.__version__}")
-
-try:
-    import pandas as pd
-    import numpy as np
-    import plotly
-    import plotly.graph_objects as go
-    st.sidebar.write(f"**Pandas:** {pd.__version__}")
-    st.sidebar.write(f"**Numpy:** {np.__version__}")
-    st.sidebar.write(f"**Plotly:** {plotly.__version__}")  # ← CORRECTO
-    st.sidebar.success("✅ Todas las dependencias cargadas")
-except Exception as e:
-    st.sidebar.error(f"❌ Error: {e}")
-
-
-import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
