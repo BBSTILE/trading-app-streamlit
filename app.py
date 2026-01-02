@@ -14,6 +14,7 @@ from typing import Optional, Dict, List
 __version__ = "1.0.17"
 __author__ = "De Crypto Club"
 __email__ = "0xdcryptoclub@gmail.com"
+__Donaciones__ = "TMjChBYrfQi27hQdDs8S6ce2xowWb1YSK5" #USDT TRC20
 
 st.set_page_config(page_title="Trading Evaluation Tester",
                    page_icon="📊",
