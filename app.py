@@ -14,7 +14,6 @@ from typing import Optional, Dict, List
 __version__ = "1.0.17"
 __author__ = "De Crypto Club"
 __email__ = "0xdcryptoclub@gmail.com"
-__Donaciones__ = "TMjChBYrfQi27hQdDs8S6ce2xowWb1YSK5" #USDT TRC20
 
 st.set_page_config(page_title="Trading Evaluation Tester",
                    page_icon="📊",
@@ -2163,4 +2162,11 @@ st.sidebar.markdown("---")
 st.sidebar.markdown(f"**Versión:** {__version__}")
 st.sidebar.markdown("**Autor:** De Crypto Club")
 
-st.sidebar.markdown("**GitHub:** [de-crypto-club](https://github.com/de-crypto-club)")
+st.sidebar.markdown("**GitHub:** [de-crypto-club](https://github.com/BBSTILE)")
+st.sidebar.markdown("---")
+with st.sidebar.expander("💝 Donaciones", expanded=False):
+    st.write("**USDT (TRC20)**")
+    st.code("TMjChBYrfQi27hQdDs8S6ce2xowWb1YSK5")
+          
+    st.caption("Gracias por apoyar el desarrollo open source")
+
