@@ -743,6 +743,8 @@ def run_evaluation_simulation(df,
     if stats['active_evaluations'] > stats['max_evaluations']:
         st.error(f"❌ CRÍTICO: Se excedió el límite de evaluaciones ({stats['active_evaluations']}/{stats['max_evaluations']})")
 
+    st.session_state["limits"] = limits
+    
     return all_results, all_sheets
 
 def run_master_simulation(df, date_column, profit_column, pass_date, config, tracker=None, eval_name=""):
@@ -1501,8 +1503,8 @@ def export_to_excel(eval_results, eval_sheets, config=None):
     output.seek(0)
     return output
 
-def calcular_resumen_estandar(eval_results, tracker):
-    """Calcula el resumen estándar a partir de los resultados y el tracker"""
+def calcular_resumen_estandar(eval_results, tracker, limits=None):
+    """Calcula el resumen estándar a partir de los resultados, tracker y límites"""
     if not eval_results or not tracker:
         return None
     
@@ -1515,6 +1517,10 @@ def calcular_resumen_estandar(eval_results, tracker):
     evaluaciones_df = results_df[results_df["Tipo"] == "EVALUACIÓN"]
     masters_df = results_df[results_df["Tipo"] == "MASTER"]
     
+    # === NUEVO: Contar estados especiales ===
+    evaluaciones_en_espera = len(evaluaciones_df[evaluaciones_df["Estado"] == "PASS_WAITING"])
+    evaluaciones_no_iniciadas = len(evaluaciones_df[evaluaciones_df["Estado"] == "LIMIT_EXCEEDED"])
+    
     evaluaciones_totales = len(evaluaciones_df)
     evaluaciones_aprobadas = len(evaluaciones_df[evaluaciones_df["Estado"] == "PASS"])
     evaluaciones_fallidas = len(evaluaciones_df[evaluaciones_df["Estado"] == "FAIL"])
@@ -1525,6 +1531,7 @@ def calcular_resumen_estandar(eval_results, tracker):
     masters_cashed_out = len(masters_df[masters_df["Estado"] == "CASHED_OUT"])
     masters_activas = len(masters_df[masters_df["Estado"] == "ACTIVE"])
     masters_sin_trades = len(masters_df[masters_df["Estado"] == "ACTIVE_NO_TRADES"])
+    masters_en_espera = len(masters_df[masters_df["Estado"] == "WAITING_FOR_CUPO"])
     
     masters_activas_df = masters_df[masters_df["Estado"].isin(["ACTIVE", "ACTIVE_NO_TRADES"])]
     if not masters_activas_df.empty and "Balance Final" in masters_activas_df.columns:
@@ -1538,11 +1545,24 @@ def calcular_resumen_estandar(eval_results, tracker):
     total_costos = summary.get('total_costs', 0)
     neto = total_retirado - total_costos
     
+    # === NUEVO: Obtener stats de límites si están disponibles ===
+    if limits:
+        limits_stats = limits.get_stats()
+        evaluaciones_activas_limite = limits_stats['active_evaluations']
+        masters_activas_limite = limits_stats['active_masters']
+        en_espera_limite = limits_stats['waiting_for_master']
+    else:
+        evaluaciones_activas_limite = "N/A"
+        masters_activas_limite = "N/A"
+        en_espera_limite = "N/A"
+    
     resumen = {
         'evaluaciones_totales': evaluaciones_totales,
         'evaluaciones_aprobadas': evaluaciones_aprobadas,
         'evaluaciones_fallidas': evaluaciones_fallidas,
         'evaluaciones_abiertas': evaluaciones_abiertas,
+        'evaluaciones_en_espera': evaluaciones_en_espera,  # NUEVO
+        'evaluaciones_no_iniciadas': evaluaciones_no_iniciadas,  # NUEVO
         'tasa_aprobacion': (evaluaciones_aprobadas / evaluaciones_totales * 100) if evaluaciones_totales > 0 else 0,
         
         'masters_totales': masters_totales,
@@ -1550,6 +1570,7 @@ def calcular_resumen_estandar(eval_results, tracker):
         'masters_cashed_out': masters_cashed_out,
         'masters_activas': masters_activas,
         'masters_sin_trades': masters_sin_trades,
+        'masters_en_espera': masters_en_espera,  # NUEVO
         'tasa_supervivencia': ((masters_totales - masters_quemadas) / masters_totales * 100) if masters_totales > 0 else 0,
         
         'balance_promedio': balance_promedio,
@@ -1562,9 +1583,15 @@ def calcular_resumen_estandar(eval_results, tracker):
         'retiros_parciales': summary.get('withdrawals_partial_amount', 0),
         'gran_cashout': summary.get('withdrawals_all_amount', 0),
         
+        # Límites concurrentes
+        'evaluaciones_activas_limite': evaluaciones_activas_limite,  # NUEVO
+        'masters_activas_limite': masters_activas_limite,  # NUEVO
+        'en_espera_limite': en_espera_limite,  # NUEVO
+        
         'tracker_evaluations_started': summary.get('evaluations_started', 0),
         'tracker_evaluations_passed': summary.get('evaluations_passed', 0),
         'tracker_evaluations_failed': summary.get('evaluations_failed', 0),
+        'tracker_evaluations_waiting': summary.get('evaluations_waiting', 0),  # NUEVO
         'tracker_masters_started': summary.get('masters_started', 0),
         'tracker_masters_burned': summary.get('masters_burned', 0),
         'tracker_masters_cashed_out': summary.get('masters_cashed_out', 0),
@@ -1576,7 +1603,7 @@ def calcular_resumen_estandar(eval_results, tracker):
     
     return resumen
 
-def mostrar_resumen_estandar(resumen, tracker=None):
+def mostrar_resumen_estandar(resumen, tracker=None, limits_stats=None):
     """Muestra el resumen estándar en la interfaz"""
     if not resumen:
         st.info("ℹ️ No hay datos para mostrar el resumen estándar")
@@ -1590,6 +1617,34 @@ def mostrar_resumen_estandar(resumen, tracker=None):
         
         st.warning("⚠️ **Nota:** Existen discrepancias menores en los cálculos entre diferentes métodos de conteo.")
     
+    # === NUEVA SECCIÓN: LÍMITES CONCURRENTES ===
+    if resumen.get('evaluaciones_en_espera', 0) > 0 or resumen.get('masters_en_espera', 0) > 0:
+        st.markdown("---")
+        st.header("🚦 ESTADO DE LÍMITES CONCURRENTES")
+        
+        col_limits1, col_limits2, col_limits3 = st.columns(3)
+        
+        with col_limits1:
+            st.metric("Evaluaciones Activas", 
+                     resumen.get('evaluaciones_activas_limite', 'N/A'),
+                     f"Máximo: 20")
+        
+        with col_limits2:
+            st.metric("Masters Activas", 
+                     resumen.get('masters_activas_limite', 'N/A'),
+                     f"Máximo: 20")
+        
+        with col_limits3:
+            total_espera = resumen.get('evaluaciones_en_espera', 0) + resumen.get('masters_en_espera', 0)
+            st.metric("Cuentas en Espera", total_espera)
+        
+        # Detalle de espera
+        if resumen.get('evaluaciones_en_espera', 0) > 0:
+            st.info(f"⏳ **{resumen['evaluaciones_en_espera']} evaluación(es) en espera** - Pasaron 53K pero no hay cupo para Master")
+        
+        if resumen.get('masters_en_espera', 0) > 0:
+            st.info(f"⏳ **{resumen['masters_en_espera']} master(s) en espera** - Esperando cupo para activar")
+    
     col1, col2 = st.columns(2)
     
     with col1:
@@ -1598,16 +1653,34 @@ def mostrar_resumen_estandar(resumen, tracker=None):
         st.metric("Evaluaciones Aprobadas", resumen['evaluaciones_aprobadas'], 
                  f"{resumen['tasa_aprobacion']:.1f}%")
         st.metric("Evaluaciones Fallidas", resumen['evaluaciones_fallidas'])
-        if resumen['evaluaciones_abiertas'] > 0:
-            st.metric("Evaluaciones Abiertas", resumen['evaluaciones_abiertas'])
+        
+        # === NUEVO: Mostrar estados especiales ===
+        if resumen.get('evaluaciones_en_espera', 0) > 0:
+            st.metric("✅ En espera (pasaron)", resumen['evaluaciones_en_espera'], 
+                     "Esperando cupo Master", delta_color="off")
+        
+        if resumen.get('evaluaciones_abiertas', 0) > 0:
+            st.metric("⏳ Evaluaciones Abiertas", resumen['evaluaciones_abiertas'])
+        
+        if resumen.get('evaluaciones_no_iniciadas', 0) > 0:
+            st.metric("🚫 No iniciadas", resumen['evaluaciones_no_iniciadas'],
+                     "Límite excedido", delta_color="off")
         
         st.markdown("---")
         st.markdown("### 🧠 Másters")
         st.metric("Másters Totales", resumen['masters_totales'])
         st.metric("Másters Activas", resumen['masters_activas'])
         st.metric("Másters Quemadas", resumen['masters_quemadas'])
+        
+        if resumen.get('masters_en_espera', 0) > 0:
+            st.metric("⏳ Masters en espera", resumen['masters_en_espera'],
+                     "Esperando activación", delta_color="off")
+        
         if resumen['masters_cashed_out'] > 0:
-            st.metric("Cashouts Completados", resumen['masters_cashed_out'])
+            st.metric("💰 Cashouts Completados", resumen['masters_cashed_out'])
+        
+        if resumen['masters_sin_trades'] > 0:
+            st.metric("📭 Sin trades", resumen['masters_sin_trades'])
     
     with col2:
         st.markdown("### 💰 Finanzas")
@@ -1663,6 +1736,7 @@ def mostrar_resumen_estandar(resumen, tracker=None):
         else:
             st.info("No hay datos de tiempo hasta primer retiro")
     
+       
     # === NUEVA SECCIÓN: RETIROS POR MES ===
     if tracker and hasattr(tracker, 'monthly_withdrawals'):
         st.markdown("---")
@@ -2148,7 +2222,8 @@ with tabs[0]:
             if has_tracker and has_eval_results:
                 tracker = st.session_state["tracker"]
                 eval_results = st.session_state["eval_results"]
-                resumen = calcular_resumen_estandar(eval_results, tracker)
+                limits = st.session_state.get("limits", None)
+                resumen = calcular_resumen_estandar(eval_results, tracker, limits)
                 
                 if resumen:
                     mostrar_resumen_estandar(resumen, tracker)
