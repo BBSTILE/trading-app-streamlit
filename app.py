@@ -33,7 +33,7 @@ class TradingEvent:
     amount: float = 0.0
     details: Optional[Dict] = None
 
-# === NUEVA CLASE PARA TRACKING MENSUAL ===
+
 class MonthlyWithdrawalTracker:
     def __init__(self):
         self.monthly_data = {}
@@ -89,7 +89,64 @@ class MonthlyWithdrawalTracker:
         
         return pd.DataFrame(all_transactions)
 
-# === FIN DE NUEVA CLASE ===
+class TradingLimits:
+    """Controla límites concurrentes de evaluaciones y masters"""
+    def __init__(self, max_evaluations=20, max_masters=20):
+        self.max_evaluations = max_evaluations
+        self.max_masters = max_masters
+        self.active_evaluations = set()  # Eval_1, Eval_2, etc.
+        self.active_masters = set()      # Eval_1_MASTER, etc.
+        self.waiting_for_master = []     # Evaluaciones que pasaron pero esperan cupo
+        
+    def can_start_evaluation(self, eval_name):
+        """Verifica si se puede abrir nueva evaluación"""
+        return len(self.active_evaluations) < self.max_evaluations
+    
+    def can_promote_to_master(self, eval_name):
+        """Verifica si se puede promover evaluación a master"""
+        if eval_name not in self.active_evaluations:
+            return False
+        return len(self.active_masters) < self.max_masters
+    
+    def start_evaluation(self, eval_name):
+        """Registra inicio de evaluación"""
+        if self.can_start_evaluation(eval_name):
+            self.active_evaluations.add(eval_name)
+            return True
+        return False
+    
+    def promote_to_master(self, eval_name, master_name):
+        """Promueve evaluación a master"""
+        if not self.can_promote_to_master(eval_name):
+            return False
+            
+        self.active_evaluations.remove(eval_name)
+        self.active_masters.add(master_name)
+        return True
+    
+    def close_master(self, master_name):
+        """Cierra una master"""
+        if master_name in self.active_masters:
+            self.active_masters.remove(master_name)
+            return True
+        return False
+    
+    def close_evaluation(self, eval_name):
+        """Cierra una evaluación (falla o término)"""
+        if eval_name in self.active_evaluations:
+            self.active_evaluations.remove(eval_name)
+            return True
+        return False
+    
+    def get_stats(self):
+        """Obtiene estadísticas actuales"""
+        return {
+            'active_evaluations': len(self.active_evaluations),
+            'active_masters': len(self.active_masters),
+            'max_evaluations': self.max_evaluations,
+            'max_masters': self.max_masters,
+            'waiting_for_master': len(self.waiting_for_master)
+        }
 
 class TradingTracker:
     def __init__(self):
@@ -98,6 +155,7 @@ class TradingTracker:
             'evaluations_started': 0,
             'evaluations_passed': 0,
             'evaluations_failed': 0,
+            'evaluations_waiting': 0,
             'masters_started': 0,
             'masters_burned': 0,
             'masters_cashed_out': 0,
@@ -155,6 +213,10 @@ class TradingTracker:
         elif event.event_type == 'EVAL_PASS':
             self.summary['evaluations_passed'] += 1
             self.summary['total_costs'] += 175
+        elif event.event_type == 'EVAL_PASS_WAITING':  # NUEVO EVENTO
+            self.summary['evaluations_passed'] += 1
+            self.summary['evaluations_waiting'] += 1
+            self.summary['total_costs'] += 35    
         elif event.event_type == 'EVAL_FAIL':
             self.summary['evaluations_failed'] += 1
             self.summary['total_costs'] += 35
@@ -325,7 +387,7 @@ class TradingTracker:
             'monthly_summary': self.monthly_withdrawals.get_monthly_summary(),
             'detailed_transactions': self.monthly_withdrawals.get_detailed_transactions()
         }
-
+    
 def format_duration(seconds: float) -> str:
     """Formatea segundos a una cadena legible - Versión optimizada para trading"""
     if seconds is None or seconds <= 0:
@@ -472,6 +534,9 @@ def run_evaluation_simulation(df,
     all_results = []
     all_sheets = {}
     
+    # === NUEVO: Sistema de límites ===
+    limits = TradingLimits(max_evaluations=20, max_masters=20)
+    
     if strategy_column in df.columns:
         strategies = df[strategy_column].unique()
         st.info(f"📊 Se encontraron {len(strategies)} estrategias trabajando en conjunto")
@@ -483,6 +548,30 @@ def run_evaluation_simulation(df,
 
     for eval_id, start_day in enumerate(start_days, 1):
         eval_name = f"Eval_{eval_id}"
+        master_name = f"{eval_name}_MASTER"
+        
+        # === VERIFICAR LÍMITE DE EVALUACIONES ===
+        if not limits.can_start_evaluation(eval_name):
+            st.warning(f"⚠️ Límite alcanzado: Máximo {limits.max_evaluations} evaluaciones activas. Saltando {eval_name}")
+            # Registrar en resultados como NO INICIADA
+            all_results.append({
+                "Estrategia": "COMBINADA",
+                "Cuenta": eval_name,
+                "Tipo": "EVALUACIÓN",
+                "Fecha Inicio": start_day,
+                "Estado": "LIMIT_EXCEEDED",
+                "Balance Final": 0,
+                "Peak Máximo": 0,
+                "Trades": 0,
+                "Max Drawdown": 0,
+                "Account": 1
+            })
+            continue  # Saltar esta evaluación
+            
+        # Iniciar evaluación
+        if not limits.start_evaluation(eval_name):
+            st.warning(f"⚠️ No se pudo iniciar evaluación {eval_name}")
+            continue
         
         if tracker:
             # Buscar la fecha real del primer trade de esta evaluación
@@ -501,7 +590,7 @@ def run_evaluation_simulation(df,
         pass_date = None
 
         for _, row in trades.iterrows():
-            if status != "OPEN":
+            if status not in ["OPEN", "PASS_WAITING"]:
                 break
 
             pnl = row[profit_column]
@@ -525,14 +614,25 @@ def run_evaluation_simulation(df,
             if balance <= trailing:
                 status = "FAIL"
                 event = "EVAL_FAIL"
+                limits.close_evaluation(eval_name)  # Cerrar evaluación fallida
                 if tracker:
                     tracker.log_event('EVAL_FAIL', eval_name, timestamp=date)
-            elif balance >= config["target_pass"]:
-                status = "PASS"
-                event = "EVAL_PASS"
-                pass_date = date
-                if tracker:
-                    tracker.log_event('EVAL_PASS', eval_name, amount=249, timestamp=date)
+            elif balance >= config["target_pass"] and status == "OPEN":
+                # === VERIFICAR CUPO PARA MASTER ===
+                if not limits.can_promote_to_master(eval_name):
+                    status = "PASS_WAITING"  # Nuevo estado
+                    event = "EVAL_PASS_WAITING"
+                    pass_date = date
+                    if tracker:
+                        tracker.log_event('EVAL_PASS_WAITING', eval_name, amount=249, timestamp=date)
+                    # Agregar a cola de espera
+                    limits.waiting_for_master.append(eval_name)
+                else:
+                    status = "PASS"
+                    event = "EVAL_PASS"
+                    pass_date = date
+                    if tracker:
+                        tracker.log_event('EVAL_PASS', eval_name, amount=249, timestamp=date)
 
             records.append({
                 "Datetime": date,
@@ -550,18 +650,55 @@ def run_evaluation_simulation(df,
         withdrawals = []
         master_status = "NOT_APPLICABLE"
         
+        # === SOLO CORRER MASTER SI HAY CUPO ===
         if status == "PASS" and pass_date:
-            master_records, withdrawals, master_status = run_master_simulation(
-                df_combined, date_column, profit_column, pass_date, config, tracker, eval_name
-            )
+            # Registrar promoción a master
+            if limits.promote_to_master(eval_name, master_name):
+                master_records, withdrawals, master_status = run_master_simulation(
+                    df_combined, date_column, profit_column, pass_date, config, tracker, eval_name
+                )
+            else:
+                # Si no se pudo promover (raro caso)
+                master_status = "WAITING_FOR_CUPO"
+                status = "PASS_WAITING"  # Cambiar estado de evaluación
+                if event == "EVAL_PASS":
+                    # Cambiar evento de PASS a PASS_WAITING
+                    for record in records:
+                        if record.get("Event") == "EVAL_PASS":
+                            record["Event"] = "EVAL_PASS_WAITING"
+                    if tracker:
+                        # Buscar evento EVAL_PASS y cambiarlo
+                        for ev in tracker.events:
+                            if ev.event_type == "EVAL_PASS" and ev.strategy == eval_name:
+                                ev.event_type = "EVAL_PASS_WAITING"
+                                break
+                st.warning(f"⏳ {eval_name} aprobó pero no se pudo promover a master")
         
+        # === MANEJAR EVALUACIONES EN ESPERA ===
+        elif status == "PASS_WAITING":
+            master_status = "WAITING_FOR_CUPO"
+            st.info(f"⏳ {eval_name} aprobada - Esperando cupo (Masters activas: {len(limits.active_masters)}/{limits.max_masters})")
+        
+        # === CERRAR MASTER SI TERMINÓ ===
+        if master_status in ["FAIL", "CASHED_OUT"]:
+            limits.close_master(master_name)
+            # Si hay evaluaciones esperando, procesar la primera
+            if limits.waiting_for_master:
+                next_eval = limits.waiting_for_master.pop(0)
+                st.info(f"✅ Cupo liberado. {next_eval} puede promocionar a master")
+                # Aquí podrías promover automáticamente, pero para simplicidad lo dejamos así
+        
+        # === CERRAR EVALUACIÓN SI TERMINÓ (pero no está en espera) ===
+        if status == "FAIL" and eval_name in limits.active_evaluations:
+            limits.close_evaluation(eval_name)
+        
+        # Crear hoja de master si existe
         if master_records:
-            master_sheet_name = f"{eval_name}_MASTER"
-            all_sheets[master_sheet_name] = pd.DataFrame(master_records)
+            all_sheets[master_name] = pd.DataFrame(master_records)
             
             all_results.append({
                 "Estrategia": "COMBINADA",
-                "Cuenta": master_sheet_name,
+                "Cuenta": master_name,
                 "Tipo": "MASTER",
                 "Fecha Inicio": pass_date.date() if pass_date else start_day,
                 "Estado": master_status,
@@ -590,6 +727,21 @@ def run_evaluation_simulation(df,
         })
 
         all_sheets[eval_name] = pd.DataFrame(records)
+    
+    # === MOSTRAR ESTADO FINAL DE LÍMITES ===
+    stats = limits.get_stats()
+    st.sidebar.info(f"""
+    **📊 Límites Concurrentes:**
+    • ✅ Evaluaciones activas: **{stats['active_evaluations']}/{stats['max_evaluations']}**
+    • 🏆 Masters activas: **{stats['active_masters']}/{stats['max_masters']}**
+    • ⏳ Evaluaciones en espera: **{stats['waiting_for_master']}**
+    """)
+    
+    # Mostrar alertas si hay problemas
+    if stats['active_masters'] > stats['max_masters']:
+        st.error(f"❌ CRÍTICO: Se excedió el límite de masters ({stats['active_masters']}/{stats['max_masters']})")
+    if stats['active_evaluations'] > stats['max_evaluations']:
+        st.error(f"❌ CRÍTICO: Se excedió el límite de evaluaciones ({stats['active_evaluations']}/{stats['max_evaluations']})")
 
     return all_results, all_sheets
 
