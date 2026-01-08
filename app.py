@@ -8,6 +8,7 @@ from io import BytesIO
 from datetime import datetime
 import json
 import os
+import time
 from dataclasses import dataclass
 from typing import Optional, Dict, List
 
@@ -23,6 +24,19 @@ st.set_page_config(page_title="Trading Evaluation Tester",
 CONFIGS_DIR = "saved_configs"
 if not os.path.exists(CONFIGS_DIR):
     os.makedirs(CONFIGS_DIR)
+
+
+def trigger_rerun():
+    """Compatibilidad para forzar rerun en diferentes versiones de Streamlit.
+    Intenta `st.experimental_rerun()`, si no existe modifica query params para forzar rerun.
+    """
+    try:
+        st.experimental_rerun()
+    except Exception:
+        try:
+            st.query_params = {"_refresh": str(int(time.time()))}
+        except Exception:
+            pass
 
 # ===== SISTEMA DE TRACKING CORREGIDO =====
 @dataclass
@@ -149,7 +163,7 @@ class TradingLimits:
         }
 
 class TradingTracker:
-    def __init__(self):
+    def __init__(self, pricing: Optional[Dict] = None):
         self.events = []
         self.summary = {
             'evaluations_started': 0,
@@ -167,6 +181,7 @@ class TradingTracker:
             'withdrawals_all_amount': 0.0,
             'total_withdrawn': 0.0,
             'total_costs': 0.0,
+            'total_commissions': 0.0,
             'active_accounts': [],
             'max_concurrent_active': 0
         }
@@ -176,6 +191,12 @@ class TradingTracker:
         self.master_cycle_start = {}
         # === NUEVO: Añadimos el tracker mensual ===
         self.monthly_withdrawals = MonthlyWithdrawalTracker()
+        # Precios por empresa (eval_fee, promo_fee, etc.)
+        self.pricing = pricing or {
+            'eval_fee': 35,
+            'promo_fee': 249,
+            'master_fee': 0
+        }
         
     def log_event(self, event_type: str, strategy: str, amount: float = 0.0, 
                   details: Optional[Dict] = None, timestamp: Optional[datetime] = None):
@@ -210,22 +231,34 @@ class TradingTracker:
         """Actualiza el resumen basado en el tipo de evento"""
         if event.event_type == 'EVAL_START':
             self.summary['evaluations_started'] += 1
+            # Cargar costo de evaluación desde precios
+            eval_cost = self.pricing.get('eval_fee', 35)
+            self.summary['total_costs'] += eval_cost
         elif event.event_type == 'EVAL_PASS':
             self.summary['evaluations_passed'] += 1
-            self.summary['total_costs'] += 175
+            # Si el evento incluye un monto, tomarlo (ej. promo_fee), si no usar promo_fee
+            fee = event.amount if event.amount and event.amount > 0 else self.pricing.get('promo_fee', 249)
+            self.summary['total_costs'] += fee
         elif event.event_type == 'EVAL_PASS_WAITING':  # NUEVO EVENTO
             self.summary['evaluations_passed'] += 1
             self.summary['evaluations_waiting'] += 1
-            self.summary['total_costs'] += 35    
+            # Puede representar un costo parcial o reserva; tomar amount si viene
+            fee = event.amount if event.amount and event.amount > 0 else 0
+            self.summary['total_costs'] += fee
         elif event.event_type == 'EVAL_FAIL':
             self.summary['evaluations_failed'] += 1
-            self.summary['total_costs'] += 35
+            # El costo ya se cargó en EVAL_START; no sumar de nuevo a menos que se pase monto
+            pass
         elif event.event_type == 'MASTER_START':
             self.summary['masters_started'] += 1
             self.current_active.add(event.strategy)
             self.summary['active_accounts'] = list(self.current_active)
             if len(self.current_active) > self.summary['max_concurrent_active']:
                 self.summary['max_concurrent_active'] = len(self.current_active)
+            # Sumar costo asociado a iniciar una master (si aplica)
+            master_cost = self.pricing.get('master_fee', 0)
+            if master_cost and master_cost > 0:
+                self.summary['total_costs'] += master_cost
         elif event.event_type == 'MASTER_BURN':
             self.summary['masters_burned'] += 1
             if event.strategy in self.current_active:
@@ -260,7 +293,8 @@ class TradingTracker:
     
     def add_trading_costs(self, amount: float):
         """Agrega comisiones de trading a los costos totales"""
-        self.summary['total_costs'] += amount
+        # Las comisiones de trading se mantienen separadas de los costes fijos (evals/master)
+        self.summary['total_commissions'] += amount
 
     def calculate_time_metrics(self) -> Dict[str, Dict]:
         """Calcula métricas de tiempo entre eventos importantes"""
@@ -460,6 +494,46 @@ def delete_config(name):
         return True
     return False
 
+
+def get_saved_pricing_presets():
+    """Lista presets de precios guardados (archivos con prefijo pricing_)."""
+    presets = []
+    if not os.path.exists(CONFIGS_DIR):
+        return presets
+    for f in os.listdir(CONFIGS_DIR):
+        if f.startswith("pricing_") and f.endswith(".json"):
+            presets.append(f.replace("pricing_", "").replace(".json", ""))
+    return sorted(presets)
+
+
+def save_pricing_preset(name, preset):
+    # Sanitize name to create a safe filename
+    safe_name = str(name).strip()
+    for ch in ['/', '\\', ':', '*', '?', '"', '<', '>', '|']:
+        safe_name = safe_name.replace(ch, '_')
+    if not os.path.exists(CONFIGS_DIR):
+        os.makedirs(CONFIGS_DIR)
+    filepath = os.path.join(CONFIGS_DIR, f"pricing_{safe_name}.json")
+    with open(filepath, "w", encoding='utf-8') as f:
+        json.dump(preset, f, indent=2, ensure_ascii=False)
+    return True
+
+
+def load_pricing_preset(name):
+    filepath = os.path.join(CONFIGS_DIR, f"pricing_{name}.json")
+    if os.path.exists(filepath):
+        with open(filepath, "r") as f:
+            return json.load(f)
+    return None
+
+
+def delete_pricing_preset(name):
+    filepath = os.path.join(CONFIGS_DIR, f"pricing_{name}.json")
+    if os.path.exists(filepath):
+        os.remove(filepath)
+        return True
+    return False
+
 def parse_csv_data(uploaded_file, separator, date_column, profit_column,
                    strategy_column, date_format):
     try:
@@ -597,9 +671,19 @@ def run_evaluation_simulation(df,
             date = row[date_column]
             trade_strategy = row[strategy_column] if strategy_column in df.columns else "Estrategia_Única"
 
-            pnl_neto = pnl - config["comision_por_trade"]
+            # Aplicar multiplicador de contratos según balance actual
+            pos_rules = st.session_state.get('position_rules', [])
+            multiplier = get_position_multiplier(balance, pos_rules)
+            contracts = multiplier if multiplier >= 1.0 else 1.0
+            pnl = pnl * contracts
+
+            # Multiplicar comisión por número de contratos
+            commission_per_trade = float(config.get("comision_por_trade", 0.0))
+            commission_total = commission_per_trade * contracts
+
+            pnl_neto = pnl - commission_total
             if tracker:
-                tracker.add_trading_costs(config["comision_por_trade"])
+                tracker.add_trading_costs(commission_total)
 
             balance += pnl_neto
             peak = max(peak, balance)
@@ -624,7 +708,8 @@ def run_evaluation_simulation(df,
                     event = "EVAL_PASS_WAITING"
                     pass_date = date
                     if tracker:
-                        tracker.log_event('EVAL_PASS_WAITING', eval_name, amount=249, timestamp=date)
+                        promo_fee = tracker.pricing.get('promo_fee', 249)
+                        tracker.log_event('EVAL_PASS_WAITING', eval_name, amount=promo_fee, timestamp=date)
                     # Agregar a cola de espera
                     limits.waiting_for_master.append(eval_name)
                 else:
@@ -632,18 +717,20 @@ def run_evaluation_simulation(df,
                     event = "EVAL_PASS"
                     pass_date = date
                     if tracker:
-                        tracker.log_event('EVAL_PASS', eval_name, amount=249, timestamp=date)
+                        promo_fee = tracker.pricing.get('promo_fee', 249)
+                        tracker.log_event('EVAL_PASS', eval_name, amount=promo_fee, timestamp=date)
 
             records.append({
                 "Datetime": date,
                 "PnL": pnl,
-                "Comision": config["comision_por_trade"],
+                "Comision": commission_total,
                 "PnL_Neto": pnl_neto,
                 "Balance": round(balance, 2),
                 "Peak": round(peak, 2),
                 "Trailing": round(trailing, 2),
                 "Event": event,
-                "Strategy": trade_strategy
+                "Strategy": trade_strategy,
+                "Contracts": contracts
             })
         
         master_records = []
@@ -802,10 +889,20 @@ def run_master_simulation(df, date_column, profit_column, pass_date, config, tra
         pnl = row[profit_column]
         date = row[date_column]
         day = date.date()
-        
-        pnl_neto = pnl - config.get("comision_por_trade", 3.98)
+
+        # Aplicar multiplicador de contratos según balance actual (misma lógica que en evaluación)
+        pos_rules = st.session_state.get('position_rules', [])
+        multiplier = get_position_multiplier(balance, pos_rules)
+        contracts = multiplier if multiplier >= 1.0 else 1.0
+        pnl = pnl * contracts
+
+        # Multiplicar comisión por número de contratos
+        commission_per_trade = float(config.get("comision_por_trade", 3.98))
+        commission_total = commission_per_trade * contracts
+
+        pnl_neto = pnl - commission_total
         if tracker:
-            tracker.add_trading_costs(config.get("comision_por_trade", 3.98))
+            tracker.add_trading_costs(commission_total)
 
         balance += pnl_neto
         peak = max(peak, balance)
@@ -824,12 +921,13 @@ def run_master_simulation(df, date_column, profit_column, pass_date, config, tra
             records.append({
                 "Datetime": date,
                 "PnL": pnl,
-                "Comision": config.get("comision_por_trade", 3.98),
+                "Comision": commission_total,
                 "PnL_Neto": pnl_neto,
                 "Balance": balance,
                 "Peak": peak,
                 "Trailing": trailing,
-                "Event": event
+                    "Event": event,
+                    "Contracts": contracts
             })
             return records, withdrawals, "FAIL"
 
@@ -934,13 +1032,14 @@ def run_master_simulation(df, date_column, profit_column, pass_date, config, tra
                         records.append({
                             "Datetime": date,
                             "PnL": pnl,
-                            "Comision": config.get("comision_por_trade", 3.98),
+                            "Comision": commission_total,
                             "PnL_Neto": pnl_neto,
                             "Balance": balance,
                             "Peak": peak,
                             "Trailing": trailing,
                             "Event": event,
-                            "Withdrawal": withdrawal_amount
+                            "Withdrawal": withdrawal_amount,
+                            "Contracts": contracts
                         })
                         return records, withdrawals, "CASHED_OUT"
         
@@ -954,12 +1053,13 @@ def run_master_simulation(df, date_column, profit_column, pass_date, config, tra
         record_entry = {
             "Datetime": date,
             "PnL": pnl,
-            "Comision": config.get("comision_por_trade", 3.98),
+            "Comision": commission_total,
             "PnL_Neto": pnl_neto,
             "Balance": balance,
             "Peak": peak,
             "Trailing": trailing,
-            "Event": event
+            "Event": event,
+            "Contracts": contracts
         }
         
         if withdrawal_made:
@@ -1431,6 +1531,94 @@ def create_tracking_summary(tracker):
     
     return fig, summary
 
+def create_daily_financial_summary(tracker, eval_sheets):
+    """Genera un DataFrame con PnL por día, comisiones por día, retiros por día y métricas netas."""
+    try:
+        # Normalizar eval_sheets
+        if not eval_sheets:
+            eval_sheets = {}
+
+        sheets = [df for df in eval_sheets.values() if isinstance(df, pd.DataFrame) and not df.empty]
+
+        combined = pd.DataFrame()
+        if sheets:
+            combined = pd.concat(sheets, ignore_index=True)
+
+        # PnL y comisiones por día desde trades
+        if not combined.empty and 'Datetime' in combined.columns:
+            combined['Date'] = pd.to_datetime(combined['Datetime']).dt.date
+            pnl_by_day = combined.groupby('Date')['PnL'].sum().reset_index(name='PnL') if 'PnL' in combined.columns else pd.DataFrame(columns=['Date', 'PnL'])
+            comm_by_day = combined.groupby('Date')['Comision'].sum().reset_index(name='Comisiones') if 'Comision' in combined.columns else pd.DataFrame(columns=['Date', 'Comisiones'])
+        else:
+            pnl_by_day = pd.DataFrame(columns=['Date', 'PnL'])
+            comm_by_day = pd.DataFrame(columns=['Date', 'Comisiones'])
+
+        # Retiros y gastos (por compra de cuentas/promociones/masters) desde tracker.events
+        withdraws = []
+        costs = []
+        if tracker:
+            for ev in tracker.events:
+                ev_date = ev.timestamp.date()
+                if ev.event_type in ['WITHDRAW_PARTIAL', 'WITHDRAW_ALL']:
+                    withdraws.append({'Date': ev_date, 'Retiros': ev.amount})
+
+                if ev.event_type == 'EVAL_START':
+                    fee = tracker.pricing.get('eval_fee', 35) if hasattr(tracker, 'pricing') else 35
+                    costs.append({'Date': ev_date, 'Gasto_Cuentas': fee})
+                elif ev.event_type in ['EVAL_PASS', 'EVAL_PASS_WAITING']:
+                    fee = ev.amount if ev.amount and ev.amount > 0 else (tracker.pricing.get('promo_fee', 249) if hasattr(tracker, 'pricing') else 249)
+                    costs.append({'Date': ev_date, 'Gasto_Cuentas': fee})
+                elif ev.event_type == 'MASTER_START':
+                    fee = tracker.pricing.get('master_fee', 0) if hasattr(tracker, 'pricing') else 0
+                    if fee and fee > 0:
+                        costs.append({'Date': ev_date, 'Gasto_Cuentas': fee})
+
+        withdraw_df = pd.DataFrame(withdraws).groupby('Date')['Retiros'].sum().reset_index() if withdraws else pd.DataFrame(columns=['Date', 'Retiros'])
+        costs_df = pd.DataFrame(costs).groupby('Date')['Gasto_Cuentas'].sum().reset_index() if costs else pd.DataFrame(columns=['Date', 'Gasto_Cuentas'])
+
+        # Mergear todas las series
+        from functools import reduce
+        dfs = [pnl_by_day, comm_by_day, withdraw_df, costs_df]
+        df_merged = reduce(lambda left, right: pd.merge(left, right, on='Date', how='outer'), dfs)
+        df_merged = df_merged.fillna(0)
+
+        # Net dia: PnL + Retiros - Gasto_Cuentas (excluir comisiones de gastos)
+        df_merged['Net_Dia'] = df_merged.get('PnL', 0) + df_merged.get('Retiros', 0) - df_merged.get('Gasto_Cuentas', 0)
+        df_merged = df_merged.sort_values('Date')
+        # Cálculos acumulados
+        # Acumular solo los gastos de cuentas (evaluaciones/promos/masters). Las comisiones quedan fuera.
+        df_merged['Cum_Gastos'] = df_merged.get('Gasto_Cuentas', 0).cumsum()
+        df_merged['Cum_Retiros'] = df_merged.get('Retiros', 0).cumsum()
+        df_merged['Cum_PnL'] = df_merged.get('PnL', 0).cumsum()
+        df_merged['Net_Cumulado'] = df_merged['Cum_Retiros'] - df_merged['Cum_Gastos']
+
+        # Días desde último retiro
+        last_withdraw = None
+        days_since = []
+        max_gap = 0
+        for d, row in df_merged.iterrows():
+            date = row['Date']
+            if row.get('Retiros', 0) > 0:
+                last_withdraw = date
+                days_since.append(0)
+            else:
+                if last_withdraw is None:
+                    # No ha ocurrido retiro aún -> días desde inicio
+                    first_date = df_merged['Date'].min()
+                    gap = (date - first_date).days
+                    days_since.append(gap)
+                else:
+                    gap = (date - last_withdraw).days
+                    days_since.append(gap)
+            if days_since[-1] > max_gap:
+                max_gap = days_since[-1]
+
+        df_merged['Days_Since_Last_Withdrawal'] = days_since
+        df_merged['Max_Days_Without_Withdrawal'] = max_gap
+        return df_merged
+    except Exception:
+        return pd.DataFrame()
+
 def compare_csv_files(files_data, config, start_day_option):
     comparison_results = []
 
@@ -1473,35 +1661,68 @@ def compare_csv_files(files_data, config, start_day_option):
     return comparison_results
 
 def export_to_excel(eval_results, eval_sheets, config=None):
-    output = BytesIO()
+    # Intentar crear un archivo XLSX usando openpyxl, si no está disponible intentar xlsxwriter
+    try:
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            total_comisiones = 0
+            total_trades = 0
+            for sheet_name, sheet in (eval_sheets or {}).items():
+                if isinstance(sheet, pd.DataFrame) and "Comision" in sheet.columns:
+                    total_comisiones += sheet["Comision"].sum()
+                    total_trades += len(sheet)
 
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        # Crear un resumen de comisiones
-        total_comisiones = 0
-        total_trades = 0
-        for sheet_name, sheet in eval_sheets.items():
-            if "Comision" in sheet.columns:
-                total_comisiones += sheet["Comision"].sum()
-                total_trades += len(sheet)
-        
-        # Agregar hoja de resumen financiero
-        comision_por_trade = config.get("comision_por_trade", 3.98) if config else 3.98
-        resumen_financiero = pd.DataFrame({
-            "Métrica": ["Total Comisiones", "Comisión por Trade", "Total Trades"],
-            "Valor": [total_comisiones, comision_por_trade, total_trades]
-        })
-        resumen_financiero.to_excel(writer, sheet_name="Resumen_Financiero", index=False)
-        
-        pd.DataFrame(eval_results).to_excel(writer,
-                                            sheet_name="Resumen_Evals",
-                                            index=False)
+            comision_por_trade = config.get("comision_por_trade", 3.98) if config else 3.98
+            resumen_financiero = pd.DataFrame({
+                "Métrica": ["Total Comisiones", "Comisión por Trade", "Total Trades"],
+                "Valor": [total_comisiones, comision_por_trade, total_trades]
+            })
+            resumen_financiero.to_excel(writer, sheet_name="Resumen_Financiero", index=False)
 
-        for name, sheet in eval_sheets.items():
-            safe_name = name[:31]
-            sheet.to_excel(writer, sheet_name=safe_name, index=False)
+            pd.DataFrame(eval_results).to_excel(writer, sheet_name="Resumen_Evals", index=False)
 
-    output.seek(0)
-    return output
+            for name, sheet in (eval_sheets or {}).items():
+                if isinstance(sheet, pd.DataFrame):
+                    safe_name = name[:31]
+                    sheet.to_excel(writer, sheet_name=safe_name, index=False)
+
+        output.seek(0)
+        return output.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "xlsx"
+    except ModuleNotFoundError:
+        # Intentar xlsxwriter
+        try:
+            output = BytesIO()
+            with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+                total_comisiones = 0
+                total_trades = 0
+                for sheet_name, sheet in (eval_sheets or {}).items():
+                    if isinstance(sheet, pd.DataFrame) and "Comision" in sheet.columns:
+                        total_comisiones += sheet["Comision"].sum()
+                        total_trades += len(sheet)
+
+                comision_por_trade = config.get("comision_por_trade", 3.98) if config else 3.98
+                resumen_financiero = pd.DataFrame({
+                    "Métrica": ["Total Comisiones", "Comisión por Trade", "Total Trades"],
+                    "Valor": [total_comisiones, comision_por_trade, total_trades]
+                })
+                resumen_financiero.to_excel(writer, sheet_name="Resumen_Financiero", index=False)
+
+                pd.DataFrame(eval_results).to_excel(writer, sheet_name="Resumen_Evals", index=False)
+
+                for name, sheet in (eval_sheets or {}).items():
+                    if isinstance(sheet, pd.DataFrame):
+                        safe_name = name[:31]
+                        sheet.to_excel(writer, sheet_name=safe_name, index=False)
+
+            output.seek(0)
+            return output.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "xlsx"
+        except ModuleNotFoundError:
+            # Último recurso: devolver CSV simple con el resumen de evaluaciones
+            try:
+                csv_bytes = pd.DataFrame(eval_results).to_csv(index=False).encode("utf-8")
+                return csv_bytes, "text/csv", "csv"
+            except Exception:
+                return b"", "application/octet-stream", "bin"
 
 def calcular_resumen_estandar(eval_results, tracker, limits=None):
     """Calcula el resumen estándar a partir de los resultados, tracker y límites"""
@@ -1542,7 +1763,20 @@ def calcular_resumen_estandar(eval_results, tracker, limits=None):
         balance_promedio = balance_min = balance_max = 0
     
     total_retirado = summary.get('total_withdrawn', 0)
-    total_costos = summary.get('total_costs', 0)
+    # Calcular total de costes únicamente como suma de fees (evaluaciones, promociones, masters)
+    if tracker:
+        pricing = tracker.pricing if hasattr(tracker, 'pricing') else {}
+    else:
+        pricing = {}
+    eval_fee = float(pricing.get('eval_fee', 35))
+    promo_fee = float(pricing.get('promo_fee', 249))
+    master_fee = float(pricing.get('master_fee', 0))
+
+    total_evals_started = summary.get('evaluations_started', 0)
+    total_evals_passed = summary.get('evaluations_passed', 0)
+    total_masters_started = summary.get('masters_started', 0)
+
+    total_costos = (total_evals_started * eval_fee) + (total_evals_passed * promo_fee) + (total_masters_started * master_fee)
     neto = total_retirado - total_costos
     
     # === NUEVO: Obtener stats de límites si están disponibles ===
@@ -1685,11 +1919,11 @@ def mostrar_resumen_estandar(resumen, tracker=None, limits_stats=None):
     with col2:
         st.markdown("### 💰 Finanzas")
         st.metric("Total Retirado", f"${resumen['total_retirado']:,.0f}")
-        st.metric("Total Costos", f"${resumen['total_costos']:,.0f}")
-        
+        st.metric("Total Costos (fees)", f"${resumen['total_costos']:,.0f}")
+
         neto_color = "normal" if resumen['neto'] >= 0 else "inverse"
         st.metric("Resultado Neto", f"${resumen['neto']:,.0f}", 
-                 delta_color=neto_color)
+             delta_color=neto_color)
         
         st.markdown("---")
         st.markdown("### 📊 Detalle Retiros")
@@ -1800,6 +2034,93 @@ def mostrar_resumen_estandar(resumen, tracker=None, limits_stats=None):
     else:
         st.markdown("---")
         st.info("ℹ️ Ejecuta una simulación para ver los retiros por mes")
+
+    # === NUEVA SECCIÓN: RESUMEN DIARIO DE GASTOS Y RENTABILIDAD ===
+    eval_sheets = st.session_state.get("eval_sheets", None)
+    daily_df = create_daily_financial_summary(tracker, eval_sheets) if tracker else pd.DataFrame()
+
+    if not daily_df.empty:
+        st.markdown("---")
+        st.header("📆 Gastos y Rentabilidad Diaria")
+
+        col_date, col_empty = st.columns([3, 1])
+        with col_date:
+            min_date = daily_df['Date'].min()
+            max_date = daily_df['Date'].max()
+            date_range = st.date_input("Seleccionar rango de fechas", [min_date, max_date])
+
+        # Normalizar rango
+        if isinstance(date_range, (list, tuple)):
+            start_date, end_date = date_range[0], date_range[-1]
+        else:
+            start_date = end_date = date_range
+
+        filtered = daily_df[(daily_df['Date'] >= start_date) & (daily_df['Date'] <= end_date)]
+
+        if filtered.empty:
+            st.info("ℹ️ No hay datos en el rango seleccionado")
+        else:
+            # Asegurar columnas esperadas
+            for col_name in ['PnL', 'Comisiones', 'Retiros', 'Gasto_Cuentas', 'Net_Dia', 'Cum_Gastos', 'Cum_Retiros', 'Net_Cumulado', 'Days_Since_Last_Withdrawal', 'Max_Days_Without_Withdrawal']:
+                if col_name not in filtered.columns:
+                    filtered[col_name] = 0
+
+            # Mostrar métricas clave
+            colm1, colm2, colm3, colm4 = st.columns(4)
+            with colm1:
+                st.metric("Total Gastos (acumulado)", f"${filtered['Cum_Gastos'].iloc[-1]:,.2f}")
+            with colm2:
+                st.metric("Total Retiros (acumulado)", f"${filtered['Cum_Retiros'].iloc[-1]:,.2f}")
+            with colm3:
+                st.metric("Net Acumulado", f"${filtered['Net_Cumulado'].iloc[-1]:,.2f}")
+            with colm4:
+                st.metric("Máx días sin retiros", int(filtered['Max_Days_Without_Withdrawal'].iloc[-1]))
+
+            # Opciones de visualización: opción de mostrar tabla en el área principal
+            show_table = st.checkbox("Mostrar tabla diaria (expandir)", value=False, key='show_daily_table')
+
+            # Gráfico acumulado y diario
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.6, 0.4], vertical_spacing=0.08)
+            # Acumulados
+            fig.add_trace(go.Scatter(x=filtered['Date'], y=filtered['Cum_Gastos'], name='Gastos Acumulados', line=dict(color='#DC3545')), row=1, col=1)
+            fig.add_trace(go.Scatter(x=filtered['Date'], y=filtered['Cum_Retiros'], name='Retiros Acumulados', line=dict(color='#28A745')), row=1, col=1)
+            fig.add_trace(go.Scatter(x=filtered['Date'], y=filtered['Net_Cumulado'], name='Net Acumulado', line=dict(color='#17A2B8')), row=1, col=1)
+
+            # Diarios
+            fig.add_trace(go.Bar(x=filtered['Date'], y=filtered['Gasto_Cuentas'], name='Gasto Cuentas', marker_color='#6f42c1'), row=2, col=1)
+            fig.add_trace(go.Bar(x=filtered['Date'], y=filtered['Comisiones'], name='Comisiones', marker_color='#DC3545'), row=2, col=1)
+            fig.add_trace(go.Bar(x=filtered['Date'], y=filtered['Retiros'], name='Retiros', marker_color='#28A745'), row=2, col=1)
+            fig.add_trace(go.Scatter(x=filtered['Date'], y=filtered['Net_Dia'], name='Net Diario', line=dict(color='#17A2B8')), row=2, col=1)
+
+            # Colocar gráfico y controles lado a lado
+            col_chart, col_ctrl = st.columns([5, 1])
+            with col_ctrl:
+                chart_height = st.slider("Altura del gráfico (px)", min_value=300, max_value=1400, value=640, step=10, key='daily_chart_height')
+                full_width = st.checkbox("Expandir gráfico al ancho disponible", value=True, key='daily_full_width')
+
+            fig.update_layout(height=chart_height, legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1))
+            with col_chart:
+                st.plotly_chart(fig, use_container_width=full_width)
+
+            # Mostrar tabla solo si el usuario lo solicita
+            if show_table:
+                # Mostrar tabla con valores por defecto (últimas 50 filas)
+                display_cols = ['Date', 'PnL', 'Comisiones', 'Gasto_Cuentas', 'Retiros', 'Net_Dia', 'Days_Since_Last_Withdrawal', 'Net_Cumulado']
+                display_df = filtered.copy()
+                display_df['Date'] = display_df['Date'].astype(str)
+                for c in ['PnL', 'Comisiones', 'Gasto_Cuentas', 'Retiros', 'Net_Dia', 'Net_Cumulado']:
+                    if c in display_df.columns:
+                        display_df[c] = display_df[c].apply(lambda x: f"${x:,.2f}")
+                n = min(50, len(display_df))
+                st.dataframe(display_df[display_cols].tail(n), use_container_width=True)
+
+            csv = filtered.to_csv(index=False)
+            st.download_button(label="📥 Descargar Resumen Diario CSV", data=csv,
+                               file_name=f"resumen_diario_{datetime.now().strftime('%Y%m%d')}.csv",
+                               mime="text/csv", use_container_width=True)
+    else:
+        st.markdown("---")
+        st.info("ℹ️ No hay datos diarios para mostrar")
     
     st.markdown("---")
     st.markdown("### 📈 Análisis Final")
@@ -1851,6 +2172,24 @@ if "config_initialized" not in st.session_state:
     defaults = get_default_config()
     apply_config_to_session(defaults)
 
+def get_position_multiplier(balance, rules):
+    """Devuelve el multiplicador de contratos aplicable según el balance y las reglas.
+
+    `rules` debe ser una lista de dicts con keys: 'threshold' y 'multiplier'.
+    Se toma la regla con el mayor threshold <= balance. Si no hay ninguna, retorna 1.0.
+    """
+    if not rules:
+        return 1.0
+    applicable = [r for r in rules if balance >= float(r.get('threshold', 0))]
+    if not applicable:
+        return 1.0
+    # Elegir la regla con el mayor umbral aplicable
+    best = max(applicable, key=lambda x: float(x.get('threshold', 0)))
+    try:
+        return float(best.get('multiplier', 1.0))
+    except Exception:
+        return 1.0
+
 with st.sidebar:
     st.header("⚙️ Configuración")
 
@@ -1885,9 +2224,10 @@ with st.sidebar:
                         st.rerun()
 
         st.markdown("---")
-        new_config_name = st.text_input("Nombre para guardar", placeholder="Mi estrategia")
+        new_config_name = st.text_input("Nombre para guardar", placeholder="Mi estrategia", key='new_config_name')
         if st.button("💾 Guardar configuración actual", use_container_width=True):
-            if new_config_name:
+            cfg_name = st.session_state.get('new_config_name', '')
+            if cfg_name:
                 current_config = {
                     "balance_inicial": st.session_state.get("balance_inicial", 50000),
                     "target_pass": st.session_state.get("target_pass", 53000),
@@ -1902,9 +2242,132 @@ with st.sidebar:
                     "start_day_option": st.session_state.get("start_day_option", "Cada Lunes"),
                     "comision_por_trade": st.session_state.get("comision_por_trade", 3.98)
                 }
-                save_config(new_config_name, current_config)
-                st.success(f"Configuración '{new_config_name}' guardada")
-                st.rerun()
+                save_config(cfg_name, current_config)
+                st.success(f"Configuración '{cfg_name}' guardada")
+                trigger_rerun()
+            else:
+                st.warning("Ingresa un nombre para guardar la configuración")
+
+        with st.sidebar.expander("🏷️ Precios por Empresa", expanded=False):
+            presets = get_saved_pricing_presets()
+            default_presets = {
+                'Apex': {'eval_fee': 35, 'promo_fee': 249, 'master_fee': 0},
+                'Otro': {'eval_fee': 40, 'promo_fee': 199, 'master_fee': 0}
+            }
+
+            options = ["-- Seleccionar --"] + presets
+            # Si acabamos de guardar y queremos que el selector vuelva a "-- Seleccionar --"
+            force_clear = st.session_state.get('clear_pricing_form', False)
+            # Determinar índice inicial del selectbox
+            initial_index = 0
+            if not force_clear and 'pricing_selector' in st.session_state:
+                try:
+                    if st.session_state['pricing_selector'] in options:
+                        initial_index = options.index(st.session_state['pricing_selector'])
+                except Exception:
+                    initial_index = 0
+
+            preset_choice = st.selectbox("Presets guardados", options,
+                                         index=initial_index,
+                                         key="pricing_selector")
+
+            # Si el usuario selecciona un preset en el selector, precargar sus valores
+            loaded_preview = None
+            if preset_choice != "-- Seleccionar --":
+                loaded_preview = load_pricing_preset(preset_choice)
+
+            # Nota: `clear_pricing_form` se procesa más abajo al determinar los valores del formulario
+
+            colp1, colp2 = st.columns(2)
+            with colp1:
+                if st.button("📂 Cargar preset", use_container_width=True, key="load_pricing_preset_btn"):
+                    # Cargar preset de precios y aplicarlo a la sesión
+                    if preset_choice != "-- Seleccionar --":
+                        loaded = load_pricing_preset(preset_choice)
+                        if loaded:
+                            st.session_state['selected_pricing'] = {
+                                'eval_fee': float(loaded.get('eval_fee', 35)),
+                                'promo_fee': float(loaded.get('promo_fee', 249)),
+                                'master_fee': float(loaded.get('master_fee', 0))
+                            }
+                            # Actualizar inputs del formulario si existen
+                            try:
+                                st.session_state['ui_eval_fee'] = float(loaded.get('eval_fee', 35))
+                                st.session_state['ui_promo_fee'] = float(loaded.get('promo_fee', 249))
+                                st.session_state['ui_master_fee'] = float(loaded.get('master_fee', 0))
+                            except Exception:
+                                pass
+                            st.success(f"Preset '{preset_choice}' cargado y aplicado")
+                            # Indicar que, si hay un archivo cargado, ejecutemos la simulación automáticamente
+                            st.session_state['run_after_preset_load'] = True
+                            trigger_rerun()
+                    else:
+                        st.warning("Selecciona un preset para cargar")
+            with colp2:
+                if st.button("🗑️ Eliminar preset", use_container_width=True):
+                    if preset_choice != "-- Seleccionar --":
+                        delete_pricing_preset(preset_choice)
+                        st.success(f"Preset '{preset_choice}' eliminado")
+                        st.rerun()
+
+            # Mostrar sección de crear/editar preset dentro de un expander desplegable
+            with st.expander("➕ Agregar / Editar preset", expanded=False):
+                preset_name = st.text_input("Nombre del preset (para guardar)", key="pricing_new_name")
+                # Cargar valores actuales o por defecto. Si seleccionó un preset, mostrar su preview inmediatamente
+                if st.session_state.get('clear_pricing_form', False):
+                    current_pricing = {'eval_fee': 0.0, 'promo_fee': 0.0, 'master_fee': 0.0}
+                    # limpiar el flag para la siguiente renderización
+                    try:
+                        del st.session_state['clear_pricing_form']
+                    except Exception:
+                        pass
+                else:
+                    current_pricing = loaded_preview if loaded_preview else st.session_state.get('selected_pricing', default_presets['Apex'])
+
+                eval_fee = st.number_input("Costo por Evaluación ($)", value=float(current_pricing.get('eval_fee', 35)), step=1.0, key='ui_eval_fee')
+                promo_fee = st.number_input("Costo por Promoción a Master ($)", value=float(current_pricing.get('promo_fee', 249)), step=1.0, key='ui_promo_fee')
+                master_fee = st.number_input("Costo adicional Master ($)", value=float(current_pricing.get('master_fee', 0)), step=1.0, key='ui_master_fee')
+
+                cola, colb = st.columns(2)
+                with cola:
+                    if st.button("💾 Guardar preset de precios", use_container_width=True):
+                        if preset_name:
+                            preset = {'eval_fee': float(eval_fee), 'promo_fee': float(promo_fee), 'master_fee': float(master_fee)}
+                            # Guardar en disco; no aplicar automáticamente para permitir limpiar el formulario
+                            save_pricing_preset(preset_name, preset)
+                            st.success(f"Preset de precios '{preset_name}' guardado")
+                            # Limpiar los campos del formulario tras guardar: usar flag para evitar que
+                            # current_pricing vuelva a cargar un preset previamente seleccionado.
+                            try:
+                                st.session_state['pricing_new_name'] = ""
+                                st.session_state['ui_eval_fee'] = 0.0
+                                st.session_state['ui_promo_fee'] = 0.0
+                                st.session_state['ui_master_fee'] = 0.0
+                                st.session_state['clear_pricing_form'] = True
+                            except Exception:
+                                pass
+                        else:
+                            st.warning("Ingresa un nombre para el preset antes de guardar")
+                with colb:
+                    if st.button("✅ Aplicar precios actuales", use_container_width=True):
+                        st.session_state['selected_pricing'] = {'eval_fee': float(eval_fee), 'promo_fee': float(promo_fee), 'master_fee': float(master_fee)}
+                        st.success("Precios aplicados a la sesión")
+                        trigger_rerun()
+
+    # === Tamaño de posición (contratos) según balance ===
+    with st.sidebar.expander("⚖️ Tamaño de posición (contratos)", expanded=False):
+        num_rules = st.number_input("Número de reglas", min_value=1, max_value=5, value=1, step=1, key="pos_num_rules")
+        rules = []
+        for i in range(int(num_rules)):
+            col_a, col_b = st.columns([2,1])
+            with col_a:
+                thr = st.number_input(f"Umbral balance >= (regla {i+1})", min_value=0.0, value=55000.0 if i==0 else 0.0, step=100.0, key=f"pos_threshold_{i}")
+            with col_b:
+                mult = st.number_input(f"Mult (regla {i+1})", min_value=0.0, value=2.0 if i==0 else 1.0, step=0.5, key=f"pos_multiplier_{i}")
+            rules.append({"threshold": float(thr), "multiplier": float(mult)})
+        rules_sorted = sorted(rules, key=lambda r: r['threshold'])
+        st.session_state['position_rules'] = rules_sorted
+        st.caption("La regla con mayor umbral aplicable determina el número de contratos.")
 
     st.subheader("📁 Archivo de Datos")
     uploaded_file = st.file_uploader("Cargar archivo CSV de NinjaTrader", type=["csv"],
@@ -1986,10 +2449,27 @@ with tabs[0]:
             if start_days:
                 total_evals = len(start_days)
                 st.info(f"📅 Se simularán {total_evals} evaluaciones")
+                # Ejecutar automáticamente si venimos de cargar un preset y hay archivo cargado
+                if st.session_state.get('run_after_preset_load', False):
+                    # Asegurarse de que hay datos cargados en esta ejecución
+                    if 'df' in locals() and df is not None:
+                        with st.spinner("Aplicando preset y ejecutando simulación..."):
+                            pricing_to_use = st.session_state.get('selected_pricing', None)
+                            tracker = TradingTracker(pricing=pricing_to_use)
+                            eval_results, eval_sheets = run_evaluation_simulation(
+                                df, date_col, profit_col, strategy_col, config, start_days, tracker
+                            )
+                            st.session_state["eval_results"] = eval_results
+                            st.session_state["eval_sheets"] = eval_sheets
+                            st.session_state["tracker"] = tracker
+                            st.session_state['run_after_preset_load'] = False
+                            st.success("✅ Simulación completada con preset cargado")
+                            trigger_rerun()
 
-                if st.button("🚀 Ejecutar Simulación", type="primary", use_container_width=True):
+                if st.button("🚀 Ejecutar Simulación", type="primary", use_container_width=True, key="run_simulation_btn"):
                     with st.spinner("Ejecutando simulación..."):
-                        tracker = TradingTracker()
+                        pricing_to_use = st.session_state.get('selected_pricing', None)
+                        tracker = TradingTracker(pricing=pricing_to_use)
                         eval_results, eval_sheets = run_evaluation_simulation(
                             df, date_col, profit_col, strategy_col, config, start_days, tracker
                         )
@@ -2203,19 +2683,25 @@ with tabs[0]:
             st.header("📥 Exportar Resultados")
             col1, col2 = st.columns(2)
             with col1:
-                excel_data = export_to_excel(eval_results, eval_sheets, config)
-                st.download_button(label="📥 Descargar Excel Completo", data=excel_data,
-                                 file_name=f"Evaluaciones_Trading_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                 use_container_width=True)
+                blob, mime_type, ext = export_to_excel(eval_results, eval_sheets, config)
+                if ext == 'xlsx' and blob:
+                    st.download_button(label="📥 Descargar Excel Completo", data=blob,
+                                     file_name=f"Evaluaciones_Trading_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                                     mime=mime_type,
+                                     use_container_width=True)
+                elif ext == 'csv' and blob:
+                    st.download_button(label="📥 Descargar CSV Completo", data=blob,
+                                     file_name=f"Evaluaciones_Trading_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                                     mime=mime_type,
+                                     use_container_width=True)
+                else:
+                    st.warning("⚠️ No se pudo generar el archivo Excel. Instala 'openpyxl' o 'xlsxwriter' para habilitar exportación XLSX. Ejecuta: pip install -r requirements.txt")
             with col2:
                 csv_data = results_df.to_csv(index=False)
                 st.download_button(label="📥 Descargar Resumen CSV", data=csv_data,
                                  file_name=f"Resumen_Evaluaciones_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                                  mime="text/csv", use_container_width=True)
 
-            st.markdown("---")
-            st.header("📊 RESULTADO — RESUMEN ESTÁNDAR")
             has_tracker = "tracker" in st.session_state and st.session_state["tracker"] is not None
             has_eval_results = "eval_results" in st.session_state and st.session_state["eval_results"]
             
@@ -2396,4 +2882,3 @@ with st.sidebar.expander("💝 Donaciones", expanded=False):
     st.code("TMjChBYrfQi27hQdDs8S6ce2xowWb1YSK5")
           
     st.caption("Gracias por apoyar el desarrollo open source")
-
